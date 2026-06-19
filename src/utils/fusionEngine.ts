@@ -11,23 +11,25 @@
 
 import { artworkToCanvas, neuralStylize } from './neuralFusion';
 
-const ART_URL = (id: number) =>
-  `https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/pokemon/other/official-artwork/${id}.png`;
-
 export interface FusionResult {
   dataUrl: string;
   hue1: number;
   hue2: number;
 }
 
-export async function generateFusion(id1: number, id2: number): Promise<FusionResult> {
+/**
+ * Generate a neural fusion from two official-artwork URLs.
+ * Body (content) → shape; Skin (style) → colour & texture.
+ * Assignment is randomised each call for variety.
+ */
+export async function generateFusion(url1: string, url2: string): Promise<FusionResult> {
   // Randomly decide which Pokémon is the body and which is the skin
-  const [bodyId, skinId] = Math.random() < 0.5 ? [id1, id2] : [id2, id1];
+  const [bodyUrl, skinUrl] = Math.random() < 0.5 ? [url1, url2] : [url2, url1];
 
   // Load artwork (matches sizes used in the standalone demo)
   const [contentCanvas, styleCanvas] = await Promise.all([
-    artworkToCanvas(ART_URL(bodyId), 384), // content — large for detail
-    artworkToCanvas(ART_URL(skinId), 256), // style   — 256 is what the model expects
+    artworkToCanvas(bodyUrl, 384), // content — large for detail
+    artworkToCanvas(skinUrl, 256), // style   — 256 is what the model expects
   ]);
 
   // Run neural style transfer
