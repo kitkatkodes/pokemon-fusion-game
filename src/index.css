@@ -1,0 +1,79 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ── Custom scrollbar ─────────────────────────────────── */
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: #0a0a0f; }
+::-webkit-scrollbar-thumb { background: #2d2d4e; border-radius: 3px; }
+
+/* ── Base ────────────────────────────────────────────── */
+body {
+  background: #0a0a0f;
+  color: #e2e8f0;
+  font-family: 'Exo 2', sans-serif;
+  user-select: none;
+}
+
+/* ── Noise texture overlay ───────────────────────────── */
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+  opacity: 0.025;
+  pointer-events: none;
+  z-index: 9999;
+}
+
+/* ── Grid background ─────────────────────────────────── */
+.grid-bg {
+  background-image:
+    linear-gradient(rgba(76, 201, 240, 0.03) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(76, 201, 240, 0.03) 1px, transparent 1px);
+  background-size: 40px 40px;
+}
+
+/* ── Card hover glow ─────────────────────────────────── */
+.card-glow:hover {
+  box-shadow:
+    0 0 0 1px rgba(76, 201, 240, 0.4),
+    0 0 20px rgba(76, 201, 240, 0.15),
+    0 0 40px rgba(76, 201, 240, 0.05);
+}
+
+/* ── Neon text ───────────────────────────────────────── */
+.neon-text {
+  text-shadow:
+    0 0 7px currentColor,
+    0 0 10px currentColor,
+    0 0 21px currentColor;
+}
+
+/* ── Scanline animation ──────────────────────────────── */
+@keyframes scanline {
+  0%   { transform: translateY(-100%); }
+  100% { transform: translateY(100vh); }
+}
+.scanline::after {
+  content: '';
+  position: absolute;
+  inset-inline: 0;
+  height: 2px;
+  background: linear-gradient(transparent, rgba(76,201,240,0.08), transparent);
+  animation: scanline 4s linear infinite;
+}
+
+/* ── Pokéball spinner ────────────────────────────────── */
+@keyframes spin-slow { to { transform: rotate(360deg); } }
+.pokeball-spin { animation: spin-slow 1.5s linear infinite; }
+
+/* ── Glitch effect ───────────────────────────────────── */
+@keyframes glitch-1 {
+  0%   { clip-path: inset(0 0 95% 0); transform: translate(-3px, 0); }
+  20%  { clip-path: inset(40% 0 55% 0); transform: translate(3px, 0); }
+  40%  { clip-path: inset(70% 0 10% 0); transform: translate(-1px, 0); }
+  60%  { clip-path: inset(20% 0 75% 0); transform: translate(2px, 0); }
+  80%  { clip-path: inset(85% 0 5% 0); transform: translate(-2px, 0); }
+  100% { clip-path: inset(0 0 95% 0); transform: translate(0, 0); }
+}
