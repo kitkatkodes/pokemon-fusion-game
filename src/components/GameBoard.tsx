@@ -96,7 +96,7 @@ export default function GameBoard({
           <FusionDisplay
             dataUrl={currentRound?.fusionDataUrl ?? null}
             isLoading={isLoading}
-            revealed={isReveal}
+            revealed={true}
             isCorrect={isReveal ? isCorrect : null}
           />
         </motion.div>
