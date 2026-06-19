@@ -1,302 +1,256 @@
 /**
  * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- *  WHO'S THAT FUSION? — Computer Vision Fusion Pipeline
+ *  Who's That Fusion? — Fusion Pipeline
  * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
  *
- * Multi-stage fusion algorithm:
+ *  Primary path — Neural Style Transfer (TensorFlow.js):
+ *  ┌─────────────────────────────────────────────────────┐
+ *  │  pass 1: stylize(A→content, B→style)                │
+ *  │          → A's SHAPE with B's COLOURS & TEXTURE     │
+ *  │  pass 2: stylize(B→content, A→style)                │
+ *  │          → B's SHAPE with A's COLOURS & TEXTURE     │
+ *  │  splice: top 50% of pass1 + bottom 50% of pass2    │
+ *  │          = one creature, neither A nor B alone      │
+ *  └─────────────────────────────────────────────────────┘
  *
- *  1. Load & normalise both sprites to 256×256 RGBA
- *  2. Extract silhouette masks (alpha channel)
- *  3. Compute Sobel edge maps for structural guidance
- *  4. Build a spatial blend mask:
- *     - Diagonal gradient provides overall split direction
- *     - Alpha masks force transparent regions to use the
- *       other sprite (avoids floating features on blank bg)
- *     - Gaussian blur (σ≈20 px) produces a smooth seam
- *  5. Laplacian Pyramid Blending (4 levels):
- *     - Each channel (R,G,B,A) is decomposed into coarse +
- *       fine detail bands; bands are blended independently
- *       at different scales → avoids ghosting / halos
- *  6. Color grading:
- *     - Compute dominant hue of each sprite
- *     - Shift result hue by 50% of the difference
- *     - Boost saturation slightly for a vivid "fused" look
- *  7. Add subtle scanline texture for the gaming aesthetic
- *
- *  All processing runs in the browser using Canvas 2D API
- *  and typed arrays.  No server, no WASM, no external deps.
+ *  Fallback path (TF.js unavailable / OOM):
+ *    Horizontal head/body splice with colour harmonisation
+ *    (no neural component but still produces one body)
  */
 
-import {
-  FUSION_SIZE,
-  loadSpriteAsImageData,
-  imageDataToDataURL,
-  gaussianBlurGray,
-  downsample2x,
-  upsample2x,
-} from './imageProcessing';
-import { sobelEdges, extractDominantColors, computeHueShift } from './edgeDetection';
-import { applyHueRotation, avgLightness, transferLuminance } from './colorAnalysis';
+import { loadSpriteAsImageData, imageDataToDataURL, FUSION_SIZE } from './imageProcessing';
+import { extractDominantColors }                                    from './edgeDetection';
+import { rgbToHsl, hslToRgb }                                      from './colorAnalysis';
+import { neuralStylize }                                           from './neuralFusion';
 
-// ─── Types ────────────────────────────────────────────────
+// ─── Shared maths ─────────────────────────────────────────
 
-interface PyramidLevel {
-  data: Float32Array;
-  width: number;
-  height: number;
+function smoothstep(t: number): number {
+  const c = Math.max(0, Math.min(1, t));
+  return c * c * (3 - 2 * c);
 }
 
-// ─── Laplacian Pyramid helpers ────────────────────────────
-
-function buildGaussianPyramid(input: Float32Array, w: number, h: number, levels: number): PyramidLevel[] {
-  const pyramid: PyramidLevel[] = [{ data: new Float32Array(input), width: w, height: h }];
-  for (let i = 1; i < levels; i++) {
-    const prev = pyramid[i - 1];
-    const blurred = gaussianBlurGray(prev.data, prev.width, prev.height, 1.5);
-    const down = downsample2x(blurred, prev.width, prev.height);
-    pyramid.push({ data: down, width: Math.floor(prev.width / 2), height: Math.floor(prev.height / 2) });
-  }
-  return pyramid;
-}
-
-function buildLaplacianPyramid(gauss: PyramidLevel[]): PyramidLevel[] {
-  const lap: PyramidLevel[] = [];
-  for (let i = 0; i < gauss.length - 1; i++) {
-    const cur = gauss[i];
-    const next = gauss[i + 1];
-    const up = upsample2x(next.data, next.width, next.height);
-    // Crop/pad to match current level size
-    const diff = new Float32Array(cur.width * cur.height);
-    for (let j = 0; j < diff.length; j++) diff[j] = cur.data[j] - (up[j] ?? 0);
-    lap.push({ data: diff, width: cur.width, height: cur.height });
-  }
-  lap.push(gauss[gauss.length - 1]); // coarsest level is kept as-is
-  return lap;
-}
-
-function blendPyramids(
-  lap1: PyramidLevel[],
-  lap2: PyramidLevel[],
-  maskPyramid: PyramidLevel[],
-): PyramidLevel[] {
-  return lap1.map((l1, i) => {
-    const l2 = lap2[i];
-    const m = maskPyramid[i];
-    const blended = new Float32Array(l1.data.length);
-    for (let j = 0; j < blended.length; j++) {
-      const w = m.data[j] ?? 0.5;
-      blended[j] = w * l1.data[j] + (1 - w) * l2.data[j];
+/** Vertical centre of mass of non-transparent pixels (y-coordinate). */
+function verticalCOM(data: ImageData): number {
+  let mass = 0, weightedY = 0;
+  const { width, height } = data;
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const a = data.data[(y * width + x) * 4 + 3] / 255;
+      mass += a;
+      weightedY += y * a;
     }
-    return { data: blended, width: l1.width, height: l1.height };
-  });
-}
-
-function reconstructFromLaplacian(lap: PyramidLevel[]): Float32Array {
-  let current = lap[lap.length - 1].data;
-  let cw = lap[lap.length - 1].width;
-  let ch = lap[lap.length - 1].height;
-
-  for (let i = lap.length - 2; i >= 0; i--) {
-    const up = upsample2x(current, cw, ch);
-    const level = lap[i];
-    current = new Float32Array(level.data.length);
-    for (let j = 0; j < current.length; j++) {
-      current[j] = (up[j] ?? 0) + level.data[j];
-    }
-    cw = level.width;
-    ch = level.height;
   }
-  return current;
+  return mass > 0 ? weightedY / mass : height / 2;
 }
 
-// ─── Blend mask construction ──────────────────────────────
+function contentBounds(data: ImageData) {
+  const { width, height } = data;
+  let top = height, bottom = 0;
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      if (data.data[(y * width + x) * 4 + 3] > 15) {
+        if (y < top) top = y;
+        if (y > bottom) bottom = y;
+      }
+    }
+  }
+  return { top, bottom };
+}
+
+// ─── Neural fusion path ────────────────────────────────────
 
 /**
- * Build a per-pixel blend weight map (Float32Array, 0=use sprite2, 1=use sprite1).
- *
- * Strategy:
- *   - Where only one sprite has alpha → use that sprite exclusively
- *   - Where both are present → use a diagonal-gradient split biased by
- *     relative edge strength (strong edges of A pull the mask toward A)
- *   - Gaussian blur the result for a smooth seam
+ * Two-pass neural style transfer → horizontal splice.
+ * Each pass (~2–4 s on GPU via WebGL) produces a stylised sprite.
+ * The splice combines them into a single-bodied creature.
  */
-function buildBlendMask(
-  data1: ImageData,
-  data2: ImageData,
-  edges1: Float32Array,
-  edges2: Float32Array,
-  size: number,
-): Float32Array {
-  const mask = new Float32Array(size * size);
+async function neuralFusion(d1: ImageData, d2: ImageData): Promise<ImageData> {
+  const SIZE = d1.width;
 
-  for (let i = 0; i < size * size; i++) {
-    const a1 = data1.data[i * 4 + 3] / 255;
-    const a2 = data2.data[i * 4 + 3] / 255;
-    const e1 = edges1[i];
-    const e2 = edges2[i];
+  // Pass 1: Sprite-A body, coloured/textured like Sprite-B
+  // Pass 2: Sprite-B body, coloured/textured like Sprite-A
+  // (sequential — WebGL context handles one inference at a time cleanly)
+  const styled1 = await neuralStylize(d1, d2, 0.78); // A shaped like B
+  const styled2 = await neuralStylize(d2, d1, 0.78); // B shaped like A
 
-    const x = i % size;
-    const y = Math.floor(i / size);
+  // Determine horizontal split at the average centre-of-mass
+  const com1 = verticalCOM(d1);
+  const com2 = verticalCOM(d2);
+  const b1   = contentBounds(d1);
+  const splitY = Math.max(
+    b1.top + (b1.bottom - b1.top) * 0.3,
+    Math.min(b1.top + (b1.bottom - b1.top) * 0.7, (com1 + com2) / 2),
+  );
+  const blendHalf = Math.round(SIZE * 0.13); // ~33 px blend zone
 
-    // Diagonal gradient 0→1 (top-left → bottom-right)
-    const diag = (x + y) / (2 * (size - 1));
+  // Splice: top of styled1 + bottom of styled2, cosine-smooth seam
+  const out = new ImageData(new Uint8ClampedArray(SIZE * SIZE * 4), SIZE, SIZE);
 
-    if (a1 > 0.15 && a2 < 0.05) {
-      // Only sprite1 has content
-      mask[i] = 1.0;
-    } else if (a2 > 0.15 && a1 < 0.05) {
-      // Only sprite2 has content
-      mask[i] = 0.0;
-    } else if (a1 > 0.15 && a2 > 0.15) {
-      // Both present: blend based on diagonal + edge competition
-      const edgeBias = e1 / (e1 + e2 + 1e-6) - 0.5; // –0.5 to +0.5
-      mask[i] = Math.min(1, Math.max(0, (1 - diag) + edgeBias * 0.3));
-    } else {
-      mask[i] = 1 - diag; // transparent background — follow diagonal
+  for (let y = 0; y < SIZE; y++) {
+    const w1 = smoothstep((splitY + blendHalf - y) / (2 * blendHalf));
+    const w2 = 1 - w1;
+
+    for (let x = 0; x < SIZE; x++) {
+      const i = (y * SIZE + x) * 4;
+
+      // Alpha: blend from the two original sprites' alphas (already on styled images)
+      const a1 = styled1.data[i + 3];
+      const a2 = styled2.data[i + 3];
+      const aOut = Math.round(a1 * w1 + a2 * w2);
+
+      if (aOut < 5) continue; // skip fully transparent pixels
+
+      out.data[i]     = Math.round(styled1.data[i]     * w1 + styled2.data[i]     * w2);
+      out.data[i + 1] = Math.round(styled1.data[i + 1] * w1 + styled2.data[i + 1] * w2);
+      out.data[i + 2] = Math.round(styled1.data[i + 2] * w1 + styled2.data[i + 2] * w2);
+      out.data[i + 3] = aOut;
     }
   }
 
-  // Smooth the seam aggressively for a natural-looking fusion
-  return gaussianBlurGray(mask, size, size, 18);
-}
-
-// ─── Per-channel pyramid blend ────────────────────────────
-
-function fuseChannel(
-  ch1: Float32Array,
-  ch2: Float32Array,
-  maskSmooth: Float32Array,
-  size: number,
-  levels = 4,
-): Float32Array {
-  const gauss1 = buildGaussianPyramid(ch1, size, size, levels);
-  const gauss2 = buildGaussianPyramid(ch2, size, size, levels);
-  const gaussMask = buildGaussianPyramid(maskSmooth, size, size, levels);
-
-  const lap1 = buildLaplacianPyramid(gauss1);
-  const lap2 = buildLaplacianPyramid(gauss2);
-
-  const blended = blendPyramids(lap1, lap2, gaussMask);
-  return reconstructFromLaplacian(blended);
-}
-
-// ─── Scanline texture ─────────────────────────────────────
-
-function applyScanlines(data: ImageData, strength = 0.06): ImageData {
-  const out = new ImageData(new Uint8ClampedArray(data.data), data.width, data.height);
-  for (let y = 0; y < data.height; y++) {
-    if (y % 2 === 0) continue; // darken every other row
-    for (let x = 0; x < data.width; x++) {
-      const i = (y * data.width + x) * 4;
+  // Subtle scanline pass for retro aesthetic
+  for (let y = 1; y < SIZE; y += 2) {
+    for (let x = 0; x < SIZE; x++) {
+      const i = (y * SIZE + x) * 4;
       if (out.data[i + 3] < 10) continue;
-      out.data[i]     = Math.round(out.data[i]     * (1 - strength));
-      out.data[i + 1] = Math.round(out.data[i + 1] * (1 - strength));
-      out.data[i + 2] = Math.round(out.data[i + 2] * (1 - strength));
+      out.data[i]     = Math.round(out.data[i]     * 0.93);
+      out.data[i + 1] = Math.round(out.data[i + 1] * 0.93);
+      out.data[i + 2] = Math.round(out.data[i + 2] * 0.93);
+    }
+  }
+
+  return out;
+}
+
+// ─── Canvas fallback path ──────────────────────────────────
+
+function bandMeanColor(data: ImageData, yStart: number, yEnd: number): [number, number, number] {
+  let r = 0, g = 0, b = 0, count = 0;
+  const { width } = data;
+  const ys = Math.max(0, Math.round(yStart));
+  const ye = Math.min(data.height - 1, Math.round(yEnd));
+  for (let y = ys; y <= ye; y++) {
+    for (let x = 0; x < width; x++) {
+      const i = (y * width + x) * 4;
+      if (data.data[i + 3] > 15) {
+        r += data.data[i]; g += data.data[i + 1]; b += data.data[i + 2]; count++;
+      }
+    }
+  }
+  return count === 0 ? [128, 128, 128] : [r / count, g / count, b / count];
+}
+
+function shiftPixelHue(
+  r: number, g: number, b: number, targetH: number, strength: number,
+): [number, number, number] {
+  const [h, s, l] = rgbToHsl(r, g, b);
+  if (s < 0.05) return [r, g, b];
+  let delta = targetH - h;
+  if (delta > 180) delta -= 360;
+  if (delta < -180) delta += 360;
+  return hslToRgb((h + delta * strength + 360) % 360, s, l);
+}
+
+/** Non-neural fallback: horizontal splice with hue harmonisation. */
+function canvasFusion(d1: ImageData, d2: ImageData): ImageData {
+  const SIZE = d1.width;
+  const com1 = verticalCOM(d1);
+  const com2 = verticalCOM(d2);
+  const b1 = contentBounds(d1);
+  const splitY = Math.max(
+    b1.top + (b1.bottom - b1.top) * 0.3,
+    Math.min(b1.top + (b1.bottom - b1.top) * 0.7, (com1 + com2) / 2),
+  );
+  const blendHalf = Math.round(SIZE * 0.14);
+
+  const mean1 = bandMeanColor(d1, splitY - blendHalf, splitY + blendHalf);
+  const mean2 = bandMeanColor(d2, splitY - blendHalf, splitY + blendHalf);
+  const [h1] = rgbToHsl(...mean1);
+  const [h2] = rgbToHsl(...mean2);
+
+  const out = new ImageData(new Uint8ClampedArray(SIZE * SIZE * 4), SIZE, SIZE);
+
+  for (let y = 0; y < SIZE; y++) {
+    const w1 = smoothstep((splitY + blendHalf - y) / (2 * blendHalf));
+    const w2 = 1 - w1;
+    const seamDist = Math.abs(y - splitY) / blendHalf;
+    const harmonyStr = Math.max(0, 1 - seamDist) * 0.4;
+
+    for (let x = 0; x < SIZE; x++) {
+      const i = (y * SIZE + x) * 4;
+      const a1 = d1.data[i + 3], a2 = d2.data[i + 3];
+      let rOut = 0, gOut = 0, bOut = 0, aOut = 0;
+
+      if (w1 >= 0.98) {
+        if (a1 > 10) { rOut = d1.data[i]; gOut = d1.data[i+1]; bOut = d1.data[i+2]; aOut = a1; }
+      } else if (w2 >= 0.98) {
+        if (a2 > 10) { rOut = d2.data[i]; gOut = d2.data[i+1]; bOut = d2.data[i+2]; aOut = a2; }
+      } else {
+        if (a1 > 10 && a2 > 10) {
+          rOut = Math.round(d1.data[i] * w1 + d2.data[i] * w2);
+          gOut = Math.round(d1.data[i+1] * w1 + d2.data[i+1] * w2);
+          bOut = Math.round(d1.data[i+2] * w1 + d2.data[i+2] * w2);
+          aOut = Math.max(a1, a2);
+        } else if (a1 > 10 && w1 > 0.15) {
+          rOut = d1.data[i]; gOut = d1.data[i+1]; bOut = d1.data[i+2];
+          aOut = Math.round(a1 * smoothstep(w1));
+        } else if (a2 > 10 && w2 > 0.15) {
+          rOut = d2.data[i]; gOut = d2.data[i+1]; bOut = d2.data[i+2];
+          aOut = Math.round(a2 * smoothstep(w2));
+        }
+      }
+
+      if (aOut > 10 && harmonyStr > 0.01) {
+        const [nr, ng, nb] = shiftPixelHue(rOut, gOut, bOut, w1 >= 0.5 ? h2 : h1, harmonyStr * (w1 >= 0.5 ? w2 : w1) * 2);
+        rOut = nr; gOut = ng; bOut = nb;
+      }
+
+      out.data[i] = rOut; out.data[i+1] = gOut; out.data[i+2] = bOut; out.data[i+3] = aOut;
     }
   }
   return out;
 }
 
-// ─── Public API ───────────────────────────────────────────
+// ─── Public interface ──────────────────────────────────────
 
 export interface FusionResult {
   dataUrl: string;
-  /** Dominant hue of each parent sprite (degrees) for display */
   hue1: number;
   hue2: number;
 }
 
 /**
- * Generate a fused Pokémon image from two sprite URLs.
- *
- * Uses a full Laplacian pyramid blend (4 levels) with an edge-guided
- * diagonal mask, followed by colour grading to merge both palettes.
+ * Generate a Pokémon fusion.
+ * Attempts neural style transfer first; falls back to canvas splice on failure.
  */
-export async function generateFusion(
-  url1: string,
-  url2: string,
-): Promise<FusionResult> {
+export async function generateFusion(url1: string, url2: string): Promise<FusionResult> {
   const SIZE = FUSION_SIZE;
-  const LEVELS = 4;
 
-  // ── 1. Load sprites ──────────────────────────────────────
-  const [raw1, raw2] = await Promise.all([
+  const [d1, d2] = await Promise.all([
     loadSpriteAsImageData(url1, SIZE),
     loadSpriteAsImageData(url2, SIZE),
   ]);
 
-  // ── 2. Edge maps ─────────────────────────────────────────
-  const edges1 = sobelEdges(raw1);
-  const edges2 = sobelEdges(raw2);
-
-  // ── 3. Blend mask ────────────────────────────────────────
-  const mask = buildBlendMask(raw1, raw2, edges1, edges2, SIZE);
-
-  // ── 4. Extract RGBA channels as Float32Arrays ─────────────
-  const extractChannel = (data: ImageData, ch: number) => {
-    const n = SIZE * SIZE;
-    const out = new Float32Array(n);
-    for (let i = 0; i < n; i++) out[i] = data.data[i * 4 + ch] / 255;
-    return out;
-  };
-
-  const [r1, g1, b1, a1] = [0, 1, 2, 3].map((ch) => extractChannel(raw1, ch));
-  const [r2, g2, b2, a2] = [0, 1, 2, 3].map((ch) => extractChannel(raw2, ch));
-
-  // ── 5. Laplacian pyramid blend per channel ────────────────
-  const rOut = fuseChannel(r1, r2, mask, SIZE, LEVELS);
-  const gOut = fuseChannel(g1, g2, mask, SIZE, LEVELS);
-  const bOut = fuseChannel(b1, b2, mask, SIZE, LEVELS);
-  const aOut = fuseChannel(a1, a2, mask, SIZE, LEVELS);
-
-  // ── 6. Pack result into ImageData ────────────────────────
-  const resultData = new Uint8ClampedArray(SIZE * SIZE * 4);
-  for (let i = 0; i < SIZE * SIZE; i++) {
-    resultData[i * 4]     = Math.round(Math.min(1, Math.max(0, rOut[i])) * 255);
-    resultData[i * 4 + 1] = Math.round(Math.min(1, Math.max(0, gOut[i])) * 255);
-    resultData[i * 4 + 2] = Math.round(Math.min(1, Math.max(0, bOut[i])) * 255);
-    resultData[i * 4 + 3] = Math.round(Math.min(1, Math.max(0, aOut[i])) * 255);
+  let fused: ImageData;
+  try {
+    fused = await neuralFusion(d1, d2);
+  } catch (err) {
+    console.warn('[Fusion] Neural path failed, using canvas fallback:', err);
+    fused = canvasFusion(d1, d2);
   }
-  let result = new ImageData(resultData, SIZE, SIZE);
 
-  // ── 7. Color grading ─────────────────────────────────────
-  const palette1 = extractDominantColors(raw1, 8);
-  const palette2 = extractDominantColors(raw2, 8);
-  const hueShift = computeHueShift(palette1, palette2);
-
-  // Shift hue halfway between both sprites and boost saturation
-  result = applyHueRotation(result, hueShift * 0.5, 1.15);
-
-  // Equalise lightness slightly toward the average of both sprites
-  const targetL = (avgLightness(raw1) + avgLightness(raw2)) / 2;
-  result = transferLuminance(result, targetL, 0.2);
-
-  // ── 8. Subtle scanline overlay for gaming aesthetic ────────
-  result = applyScanlines(result, 0.05);
-
-  // ── 9. Export ────────────────────────────────────────────
-  const avgHue = (palette: ReturnType<typeof extractDominantColors>) => {
-    let sinS = 0, cosS = 0;
-    for (const c of palette) {
-      const h = Math.atan2(
-        c.r / 255 - c.g / 255,
-        c.b / 255 - c.r / 255,
-      );
-      sinS += Math.sin(h) * c.weight;
-      cosS += Math.cos(h) * c.weight;
+  // Compute dominant hues for colour display in the UI
+  const p1 = extractDominantColors(d1, 4);
+  const p2 = extractDominantColors(d2, 4);
+  const avgHue = (p: typeof p1) => {
+    let sinSum = 0, cosSum = 0;
+    for (const c of p) {
+      const [h] = rgbToHsl(c.r, c.g, c.b);
+      sinSum += Math.sin((h * Math.PI) / 180) * c.weight;
+      cosSum += Math.cos((h * Math.PI) / 180) * c.weight;
     }
-    return ((Math.atan2(sinS, cosS) * 180) / Math.PI + 360) % 360;
+    return ((Math.atan2(sinSum, cosSum) * 180) / Math.PI + 360) % 360;
   };
 
-  return {
-    dataUrl: imageDataToDataURL(result),
-    hue1: avgHue(palette1),
-    hue2: avgHue(palette2),
-  };
-}
-
-/** Return just the data URL (convenience wrapper). */
-export async function generateFusionDataUrl(url1: string, url2: string): Promise<string> {
-  const result = await generateFusion(url1, url2);
-  return result.dataUrl;
+  return { dataUrl: imageDataToDataURL(fused), hue1: avgHue(p1), hue2: avgHue(p2) };
 }

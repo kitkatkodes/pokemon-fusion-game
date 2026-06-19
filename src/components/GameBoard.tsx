@@ -184,7 +184,7 @@ export default function GameBoard({
             animate={{ opacity: 1 }}
             className="text-slate-600 font-ui text-xs text-center max-w-xs"
           >
-            Applying Laplacian pyramid blending &amp; colour transfer…
+            Running neural style transfer — this takes a few seconds…
           </motion.p>
         )}
 
