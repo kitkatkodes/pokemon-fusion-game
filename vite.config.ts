@@ -12,9 +12,6 @@ export default defineConfig({
   },
   // Pre-bundle TF.js so Vite doesn't hit the 400+ sub-module limit at dev time
   optimizeDeps: {
-    include: [
-      '@tensorflow/tfjs',
-      '@tensorflow-models/arbitrary-image-stylization',
-    ],
+    include: ['@tensorflow/tfjs'],
   },
 })

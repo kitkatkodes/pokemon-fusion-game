@@ -1,97 +1,111 @@
 /**
  * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- *  Neural Style Transfer — browser-only via TensorFlow.js
+ *  Neural Style Transfer — TensorFlow.js, browser-only
  * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
  *
- *  Model: arbitrary-image-stylization-v1-256
- *  (Johnson et al. fast style transfer, conditioned on any style image)
+ *  Model: Google Magenta arbitrary-image-stylization-v1-256
+ *  Weights loaded at runtime from Google's public CDN (~8 MB total).
+ *  No npm package needed — only @tensorflow/tfjs.
  *
- *  Downloads ~8 MB of model weights from Google's CDN on first use,
- *  then the browser caches them — subsequent visits are instant.
+ *  Architecture (two sub-networks):
+ *   1. Style Predictor — encodes style image → 100-D bottleneck vector
+ *   2. Style Transformer — maps content image + bottleneck → stylised image
  *
- *  Backend priority: WebGL (GPU) → WASM → CPU
+ *  Backend: WebGL (GPU) → WASM → CPU (auto-detected)
  */
 
 import * as tf from '@tensorflow/tfjs';
-import { load } from '@tensorflow-models/arbitrary-image-stylization';
 
-// ─── Singleton model handle ────────────────────────────────
+// ─── Model URLs ────────────────────────────────────────────
+// Publicly hosted by the Magenta team with CORS enabled.
+const PREDICTOR_URL =
+  'https://storage.googleapis.com/magentadata/js/checkpoints/style/arbitrary/predictor_js/model.json';
+const TRANSFORMER_URL =
+  'https://storage.googleapis.com/magentadata/js/checkpoints/style/arbitrary/transferer_js/model.json';
 
-type StyleTransferModel = Awaited<ReturnType<typeof load>>;
-let _modelPromise: Promise<StyleTransferModel> | null = null;
-let _backendReady = false;
+// ─── Singleton ─────────────────────────────────────────────
 
-async function ensureBackend() {
-  if (_backendReady) return;
-  // Try fast backends first
-  for (const backend of ['webgl', 'wasm', 'cpu'] as const) {
+interface StyleModels {
+  styleNet: tf.GraphModel;
+  transformNet: tf.GraphModel;
+}
+
+let _modelsPromise: Promise<StyleModels> | null = null;
+let _backendInit = false;
+
+async function initBackend() {
+  if (_backendInit) return;
+  for (const b of ['webgl', 'wasm', 'cpu'] as const) {
     try {
-      const ok = await tf.setBackend(backend);
-      if (ok) { await tf.ready(); _backendReady = true; return; }
+      const ok = await tf.setBackend(b);
+      if (ok) { await tf.ready(); _backendInit = true; return; }
     } catch { /* try next */ }
   }
-  throw new Error('No TensorFlow.js backend available');
 }
 
 /**
- * Load (or return the already-loaded) style transfer model.
- * Safe to call multiple times — downloads only once per session.
+ * Load both sub-networks (lazy singleton — runs once, then returns cached promise).
+ * Downloads ~8 MB from Google CDN; browser caches weights after first visit.
  */
-export function loadNeuralModel(): Promise<StyleTransferModel> {
-  if (!_modelPromise) {
-    _modelPromise = (async () => {
-      await ensureBackend();
-      console.info('[Neural Fusion] Downloading style-transfer model (~8 MB)…');
-      const model = await load();
-      console.info('[Neural Fusion] Model ready. Backend:', tf.getBackend());
-      return model;
+export function loadNeuralModels(): Promise<StyleModels> {
+  if (!_modelsPromise) {
+    _modelsPromise = (async () => {
+      await initBackend();
+      console.info('[Neural Fusion] Loading Magenta style-transfer models…');
+      const [styleNet, transformNet] = await Promise.all([
+        tf.loadGraphModel(PREDICTOR_URL),
+        tf.loadGraphModel(TRANSFORMER_URL),
+      ]);
+      console.info('[Neural Fusion] Models ready. Backend:', tf.getBackend());
+      return { styleNet, transformNet };
     })();
   }
-  return _modelPromise;
+  return _modelsPromise;
 }
 
-/** Call this as early as possible (e.g. App mount) so the model is warm by game start. */
-export const preloadNeuralModel = loadNeuralModel;
+/** Call this at app startup so the model is warm before the first game round. */
+export const preloadNeuralModel = loadNeuralModels;
 
-// ─── Canvas helpers ────────────────────────────────────────
+// ─── Image helpers ─────────────────────────────────────────
 
 /**
- * Render an RGBA ImageData onto a canvas with a neutral grey background.
- * Necessary because the style transfer model expects fully opaque inputs —
- * transparent pixels would contribute black (0,0,0) to the computation.
+ * Composite an RGBA sprite onto a grey background (producing opaque output).
+ * The model expects fully opaque images — transparent areas must be filled.
  */
-function toOpaqueCanvas(data: ImageData): HTMLCanvasElement {
+function makeOpaque(data: ImageData): ImageData {
+  const n = data.width * data.height;
+  const out = new ImageData(data.width, data.height);
+  const BG = 160; // neutral grey
+  for (let i = 0; i < n; i++) {
+    const a = data.data[i * 4 + 3] / 255;
+    out.data[i * 4]     = Math.round(data.data[i * 4]     * a + BG * (1 - a));
+    out.data[i * 4 + 1] = Math.round(data.data[i * 4 + 1] * a + BG * (1 - a));
+    out.data[i * 4 + 2] = Math.round(data.data[i * 4 + 2] * a + BG * (1 - a));
+    out.data[i * 4 + 3] = 255;
+  }
+  return out;
+}
+
+/** RGBA ImageData → float32 tensor [1, H, W, 3], values normalised to [0, 1]. */
+function toTensor(data: ImageData): tf.Tensor4D {
   const { width, height } = data;
-  const cv = document.createElement('canvas');
-  cv.width = width;
-  cv.height = height;
-  const ctx = cv.getContext('2d')!;
-
-  // Neutral mid-grey background (avoids biasing colours toward black or white)
-  ctx.fillStyle = '#a0a0a0';
-  ctx.fillRect(0, 0, width, height);
-
-  // Composite the sprite over it
-  const tmp = document.createElement('canvas');
-  tmp.width = width;
-  tmp.height = height;
-  tmp.getContext('2d')!.putImageData(data, 0, 0);
-  ctx.drawImage(tmp, 0, 0);
-
-  return cv;
+  const floats = new Float32Array(width * height * 3);
+  for (let i = 0; i < width * height; i++) {
+    floats[i * 3]     = data.data[i * 4]     / 255;
+    floats[i * 3 + 1] = data.data[i * 4 + 1] / 255;
+    floats[i * 3 + 2] = data.data[i * 4 + 2] / 255;
+  }
+  return tf.tensor4d(floats, [1, height, width, 3]);
 }
 
-/**
- * Convert the model's output tensor (float32 [H,W,3] or [1,H,W,3], values 0–1)
- * back to an ImageData, restoring the original sprite's alpha channel.
- */
-async function tensorToImageData(
+/** Float32 tensor [1,H,W,3] (values 0–1) → RGBA ImageData with restored alpha. */
+async function toImageData(
   tensor: tf.Tensor,
-  originalAlpha: Uint8ClampedArray,
+  origAlpha: Uint8ClampedArray,
   width: number,
   height: number,
 ): Promise<ImageData> {
-  // Squeeze batch dim if present
+  // Squeeze batch dimension if present
   const t3 = tensor.rank === 4
     ? (tensor as tf.Tensor4D).squeeze([0]) as tf.Tensor3D
     : tensor as tf.Tensor3D;
@@ -100,13 +114,11 @@ async function tensorToImageData(
   if (t3 !== tensor) t3.dispose();
 
   const out = new ImageData(width, height);
-  const n = width * height;
-  for (let i = 0; i < n; i++) {
+  for (let i = 0; i < width * height; i++) {
     out.data[i * 4]     = Math.min(255, Math.round(floats[i * 3]     * 255));
     out.data[i * 4 + 1] = Math.min(255, Math.round(floats[i * 3 + 1] * 255));
     out.data[i * 4 + 2] = Math.min(255, Math.round(floats[i * 3 + 2] * 255));
-    // Restore the original sprite's alpha so the background stays transparent
-    out.data[i * 4 + 3] = originalAlpha[i];
+    out.data[i * 4 + 3] = origAlpha[i]; // restore transparent background
   }
   return out;
 }
@@ -114,35 +126,55 @@ async function tensorToImageData(
 // ─── Public API ────────────────────────────────────────────
 
 /**
- * Run neural style transfer in the browser.
+ * Run neural style transfer in the browser via TensorFlow.js.
  *
- * @param contentData  Sprite that determines the **shape / structure**
- * @param styleData    Sprite that determines the **colour palette & texture**
- * @param styleRatio   Blending strength (0 = pure content, 1 = full style). Default 0.8.
- * @returns            ImageData with `contentData`'s silhouette coloured like `styleData`
+ * @param contentData  Sprite that supplies the **shape / structure**
+ * @param styleData    Sprite that supplies the **colour palette & texture**
+ * @returns            ImageData: contentData's silhouette rendered in styleData's aesthetic
+ *
+ * Timing: ~2–5 s on GPU (WebGL), ~15–30 s on CPU fallback.
  */
 export async function neuralStylize(
   contentData: ImageData,
   styleData: ImageData,
-  styleRatio = 0.8,
 ): Promise<ImageData> {
-  const model = await loadNeuralModel();
+  const { styleNet, transformNet } = await loadNeuralModels();
   const { width, height } = contentData;
 
-  // Extract original alpha channel (to restore after transfer)
+  // Save original alpha before compositing on background
   const origAlpha = new Uint8ClampedArray(width * height);
-  for (let i = 0; i < width * height; i++) {
-    origAlpha[i] = contentData.data[i * 4 + 3];
+  for (let i = 0; i < width * height; i++) origAlpha[i] = contentData.data[i * 4 + 3];
+
+  // Build opaque versions for the neural network
+  const contentOpaque = makeOpaque(contentData);
+  const styleOpaque   = makeOpaque(styleData);
+
+  let styleBottleneck: tf.Tensor | null = null;
+  let stylized: tf.Tensor | null = null;
+
+  try {
+    const contentTensor = toTensor(contentOpaque);
+
+    // Style predictor expects 256×256 input
+    const styleTensor = toTensor(styleOpaque);
+    const styleResized = tf.image.resizeBilinear(
+      styleTensor as tf.Tensor4D,
+      [256, 256],
+    );
+    styleTensor.dispose();
+
+    // 1. Encode style image → bottleneck (100-D)
+    styleBottleneck = styleNet.predict(styleResized) as tf.Tensor;
+    styleResized.dispose();
+
+    // 2. Decode: content + bottleneck → stylised image
+    stylized = transformNet.predict([contentTensor, styleBottleneck]) as tf.Tensor;
+    contentTensor.dispose();
+
+    const result = await toImageData(stylized, origAlpha, width, height);
+    return result;
+  } finally {
+    styleBottleneck?.dispose();
+    stylized?.dispose();
   }
-
-  const contentCanvas = toOpaqueCanvas(contentData);
-  const styleCanvas   = toOpaqueCanvas(styleData);
-
-  // Run the neural network (WebGL-accelerated)
-  const resultTensor = await model.stylize(contentCanvas, styleCanvas, styleRatio);
-
-  const imageData = await tensorToImageData(resultTensor, origAlpha, width, height);
-  resultTensor.dispose();
-
-  return imageData;
 }
