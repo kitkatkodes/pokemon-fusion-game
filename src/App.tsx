@@ -8,8 +8,6 @@ import { preloadNeuralModel } from './utils/neuralFusion';
 export default function App() {
   const { state, startGame, nextRound, toggleSelect, submitGuess, goMenu, tick } = useGameState();
 
-  // Start downloading the neural model in the background as soon as the app loads.
-  // By the time the user picks a game mode, the model will be ready (or nearly so).
   useEffect(() => { preloadNeuralModel(); }, []);
 
   const showMenu = state.phase === 'menu';

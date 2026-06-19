@@ -184,7 +184,7 @@ export default function GameBoard({
             animate={{ opacity: 1 }}
             className="text-slate-600 font-ui text-xs text-center max-w-xs"
           >
-            Running neural style transfer — this takes a few seconds…
+            Transferring style — neural model running in your browser…
           </motion.p>
         )}
 
